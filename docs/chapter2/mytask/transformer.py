@@ -1,5 +1,6 @@
+import math
 from dataclasses import dataclass
-
+import torch
 from torch import nn
 from transformers import BertTokenizer
 
@@ -50,7 +51,61 @@ class ModelArgs:
 
 
 class PositionalEncoding(nn.Module):
-    pass
+
+    def __init__(self, args):
+        super().__init__()
+        # 创建位置编码矩阵，形状[block_size,n_emd]
+        pe = torch.zeros(args.block_size, args.n_embd)
+        # 创建位置索引[0,1,2,...,block-size-1],形状[block_size,1]
+        # 创建一个从 0 到 args.block_size-1 的整数序列
+        position = torch.arange(0, args.block_size).unsqueeze(1)
+
+        # 计算位置编码的除数项（divisor term），用于实现 Transformer 论文中的位置编码公式
+        # 公式: PE(pos, 2i) = sin(pos / 10000^(2i/d_model))
+        #       PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+        # 其中 pos 是位置，i 是维度索引，d_model 是嵌入维度
+
+        # 数学变换：1 / 10000^(2i/d_model) = exp(-2i/d_model * ln(10000))
+        # 因此 div_term = exp(arange(0, d_model, 2) * -(ln(10000) / d_model))
+
+        div_term = torch.exp(
+            # torch.arange(0, args.n_embd, 2): 生成偶数索引 [0, 2, 4, 6, ...]，对应公式中的 2i
+            # 形状: [n_embd/2]，例如 n_embd=8 时生成 tensor([0, 2, 4, 6])
+
+            # -(math.log(10000.0) / args.n_embd): 缩放因子，值为 -ln(10000)/d_model
+            # 负号使得频率随维度递减：低维度→高频率（捕捉短距离），高维度→低频率（捕捉长距离）
+
+            # 整体相乘：arange * scale 得到指数值，例如 [0, -2.3, -4.6, -6.9]
+            # torch.exp(): 对指数求幂，得到除数项，例如 [1.0, 0.1, 0.01, 0.001]
+            # 这些除数让不同维度以不同频率编码位置信息
+            torch.arange(0, args.n_embd, 2) * -(math.log(10000.0) / args.n_embd)
+        )
+        # 对偶数位置使用sin,对奇数位置是cos
+        # pe[:, 0::2] 表示所有行，从第 0 列开始每隔 2 列取一个（即偶数列：0, 2, 4, 6, ...)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        # pe[:, 1::2] 表示所有行，从第 1 列开始每隔 2 列取一个（即奇数列：1, 3, 5, 7, ...)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        # 增加 batch 维度：[block_size, n_embd] -> [1, block_size, n_embd]
+        # 添加 batch 维度：在第 0 维插入大小为 1 的维度，使位置编码能够与 3D 输入数据 [batch_size, seq_len, n_embd] 相加
+        pe = pe.unsqueeze(0)
+        # 将位置编码注册为 buffer
+        # buffer 不会被当作模型参数，但会被保存在 state_dict 中
+        self.register_buffer("pe", pe)
+
+    def forward(self, x):
+        """
+        将位置编码加到输入上
+
+        Args:
+            x: 输入张量，形状 [batch_size, seq_len, n_embd]
+
+        Returns:
+            加上位置编码的张量，形状与输入相同
+        """
+        # 取出对应长度的位置编码，并加到输入上
+        # requires_grad_(False) 确保位置编码不参与梯度计算
+        x = x + self.pe[:, :x.size(1)].requires_grad_(False)
+        return x
 
 
 class Encoder(nn.Module):
