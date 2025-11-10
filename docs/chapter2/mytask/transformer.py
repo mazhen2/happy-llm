@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from torch import nn
 from transformers import BertTokenizer
 
 
@@ -48,6 +49,53 @@ class ModelArgs:
     dropout: float  # 概率值，防止过拟合
 
 
+class PositionalEncoding(nn.Module):
+    pass
+
+
+class Encoder(nn.Module):
+    pass
+
+
+class Decoder(nn.Module):
+    pass
+
+
+class Transformer(nn.Module):
+    #     ↑          ↑
+    #   类名      父类（继承自）
+    """
+    完整的transformer 模型
+    包含Encoder 和 Decoder的完整的transformer架构，适用于序列到序列任务
+    模型结构
+    输入->embedding-位置编码->encoder->decoder->输出投影->logits
+        输出投影是一个线性变换层（nn.linear）,作用是将 Decoder 的输出向量映射到词表空间
+        logits 是输出投影后得到的原始得分（未归一化的概率），表示每个词的"可能性得分"
+    Args:
+        args:模型参数
+    """
+
+    def __init__(self, args):
+        super().__init__()
+        assert args.vocab_size is not None, "必须指定词表大小"
+        assert args.block_size is not None, "必须指定最大序列长度"
+        self.args = args
+
+        # 构建transformer的各个组件
+        self.transformer = nn.ModuleDict(dict(
+            # 词嵌入层，将token id转为向量
+            wte=nn.Embedding(args.vocab_size, args.n_embd),
+            # 位置编码,添加位置信息
+            wpe=PositionalEncoding(args),
+            # Dropout层
+            dorp=nn.Dropout(args.dropout),
+            # Encoder 模块
+            encoder=Encoder(args),
+            # Decoder 模块
+            decoder=Decoder(args)
+        ))
+
+
 def main():
     args = ModelArgs(
         n_embd=100,
@@ -83,3 +131,9 @@ def main():
     # 因为有时我们初始化ModelArgs时还没加载分词器（tokenizer），这时暂时给vocab_size赋一个默认值。
     # 加载分词器后，可以获得其实际词表大小（tokenizer.vocab_size），然后再更新到args里，确保模型和分词器词表数量一致。
     args.vocab_size = tokenizer.vocab_size
+
+    transformer = Transformer(args)
+
+
+if __name__ == "main__":
+    main()
