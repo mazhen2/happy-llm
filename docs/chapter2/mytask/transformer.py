@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 import torch
 from torch import nn
+from torch.utils.backcompat import keepdim_warning
 from transformers import BertTokenizer
 
 
@@ -108,9 +109,63 @@ class PositionalEncoding(nn.Module):
         return x
 
 
-class Encoder(nn.Module):
+class LayerNorm(nn.modules):
+    """
+    归一化层（layer Normalization）
+    与 Bach Layer 不同的是，layer Normalization 会对每个样本的所有维度的特征进行归一化
+    而不是对整个 Bach 的某一个特征进行归一化，这使得更适合序列模型（序列可变）和小Bach
+    公式: LayerNorm(x) = γ * (x - μ) / (σ + ε) + β
+    其中 μ 和 σ 是在特征维度上计算的均值和标准差
+    args:
+        features: 特征维度大小
+        eps: 防止除0的小常数，默认1e-6
+    """
+
+    def __init__(self, features, eps=1e-6):
+        super().__init__()
+        # 可学习的缩放参数γ(gamma),初始值为1
+        self.a_2 = nn.Parameter(torch.ones(features))
+        # 可学习的偏移参数β(bete),初始值为0
+        self.b_2 = nn.Parameter(torch.zeros(features))
+        # epsilon: 防止除0的小数
+        self.eps = eps
+
+    def forward(self, x):
+        # 计算最后一个维度(特征维度)的均值
+        # keepdim: 保持维度，便于广播
+        # mean: [bach_size,seq_len,1]
+        mean = x.mean(-1, keepdim=True)
+
+        # 计算最后一个维度的标准差
+        # std: [bach_size,seq_len,1]
+        std = x.std(-1, keepdim=True)
+        # 归一化：(x - μ) / (σ + ε)
+        # 然后进行缩放和偏移：γ * normalized + β
+        # 这里利用了广播机制，a_2 和 b_2 会自动扩展到匹配 x 的形状
+        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
+
+
+class EncoderLayer(nn.modules):
+    """
+    Encoder层
+    每个Encoder层包含两个子层
+    1. 多头自注意力机制
+    2. 前馈神经网络
+    每个子层都使用参差链接和归一化层
+    结构：layerNorm->MultiHeadAttention->残差连接->layerNorm->FFM->残差连接
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    # LayerNorm
     pass
 
+
+class Encoder(nn.Module):
+    def __init__(self, args):
+        super(Encoder, self).__init__()
+        # EncoderLayer
 
 class Decoder(nn.Module):
     pass
