@@ -386,7 +386,24 @@ class EncoderLayer(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, args):
         super(Encoder, self).__init__()
-        # EncoderLayer
+        # nn.ModuleList 确保这些层的参数会被正确注册
+        self.layers = nn.ModuleList([EncoderLayer(args) for _ in range(args.n_layer)])
+        # 最后的layerNorm层
+        self.norm = LayerNorm(args.n_embd)
+
+    def forward(self, x):
+        """
+        前向传播，依次通过所有Encoder层
+        args:
+            x：输入张量，形状[bach_size,seq_len_,n_embd]
+        Returns:
+            编码后的张量，形状[batch_size, seq_len, n_embd]
+        """
+        # 依次通过每个 Encoder 层
+        for layer in self.layers:
+            x = layer(x)
+        # 最后进行一次LayerNorm
+        return self.norm(x)
 
 
 class Decoder(nn.Module):
