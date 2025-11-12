@@ -2,11 +2,9 @@ import math
 from dataclasses import dataclass
 import torch
 from torch import nn
-from torch.nn.functional import dropout
 from transformers import BertTokenizer
 import torch.nn.functional as F
 
-from docs.chapter2.code.transformer import DecoderLayer
 
 
 @dataclass
