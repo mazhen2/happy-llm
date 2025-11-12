@@ -6,6 +6,8 @@ from torch.nn.functional import dropout
 from transformers import BertTokenizer
 import torch.nn.functional as F
 
+from docs.chapter2.code.transformer import DecoderLayer
+
 
 @dataclass
 class ModelArgs:
@@ -408,8 +410,135 @@ class Encoder(nn.Module):
         return self.norm(x)
 
 
+class DecoderLayer(nn.Module):
+    """
+    Decoder 层
+    每个Decoder 都包含三个部分
+    1. 带掩码的多头自注意力机制
+    2. 多头交叉注意力，关注Encoder的输出
+    3. 前馈神经网络
+
+    每个子层都使用归一化和参差连接
+
+    Args:
+        args：模型配置参数
+    """
+
+    def __init__(self, args):
+        super().__init__()
+        # 第一个LayerNorm：在掩码注意力之前
+        self.attention_norm_1 = LayerNorm(args.n_embd)
+        # 掩码自注意力，防止当前位置看到未来的信息
+        self.mask_attention = MultiHeadAttention(args, is_causal=True)
+
+        # 第二个LayerNorm：在交叉注意力之前
+        self.attention_norm_2 = LayerNorm(args.n_embd)
+        # 交叉注意力：Query 来自 Decoder，Key 和 Value 来自 Encoder
+        # 不需要掩码（is_causal=False），因为可以关注 Encoder 的所有位置
+        self.attention = MultiHeadAttention(args, is_causal=False)
+
+        # 第三个LayerNorm：在前馈神经网络之前
+        self.ffn_norm = LayerNorm(args.n_embd)
+        # 前馈神经网络
+        self.feed_forward = MLP(args.dim, args.dim, args.dropout)
+
+    def forward(self, x, enc_out):
+        """
+        前向传播
+
+        Args:
+            x: Decoder 输入张量，形状 [batch_size, tgt_seq_len, n_embd]
+            enc_out: Encoder 输出张量，形状 [batch_size, src_seq_len, n_embd]
+
+        Returns:
+            输出张量，形状 [batch_size, tgt_seq_len, n_embd]
+        """
+        # ========== 子层 1: 掩码自注意力 + 残差连接 ==========
+        # 目的：让 Decoder 理解"已经生成的内容"，但不能看到"未来的内容"
+        # 例如：翻译时生成 "我爱学习"，当前生成到 "学习" 时，只能看到 "我" 和 "爱"
+
+        # 步骤1: LayerNorm 归一化（Pre-LN 架构：先归一化再计算）
+        x_norm = self.attention_norm_1(x)
+        # x_norm 形状: [batch_size, tgt_seq_len, n_embd]
+
+        # 步骤2: 掩码自注意力（is_causal=True 使用因果掩码）
+        # Q、K、V 都来自 Decoder 输入（自注意力）
+        # 因果掩码确保：位置 i 只能看到位置 0, 1, ..., i（不能看到 i+1 及之后）
+        # 这样训练时模拟真实生成过程（逐词生成，不能偷看答案）
+        masked_attn_output = self.mask_attention.forward(x_norm, x_norm, x_norm)
+
+        # 步骤3: 残差连接（Residual Connection）
+        # 将原始输入 x 加上注意力的输出，保留原始信息并增加新特征
+        # 残差连接的好处：缓解梯度消失，让信息流动更顺畅
+        x = x + masked_attn_output
+        # x 形状: [batch_size, tgt_seq_len, n_embd]
+
+        # ========== 子层 2: 交叉注意力 + 残差连接 ==========
+        # 目的：让 Decoder 关注"输入序列"，实现源语言和目标语言的对齐
+        # 例如：生成中文 "学习" 时，应该主要关注英文的 "learning"
+
+        # 步骤1: LayerNorm 归一化
+        x_norm = self.attention_norm_2(x)
+        # x_norm: 第1个子层的输出（已包含自注意力信息）
+
+        # 步骤2: 交叉注意力（Cross-Attention）
+        # Query: 来自 Decoder（x_norm），表示"我想找什么"
+        # Key, Value: 来自 Encoder 输出（enc_out），表示"输入序列有什么"
+        # is_causal=False: 可以看到 Encoder 的所有位置（输入是完整给出的）
+        #
+        # 这就是 Decoder 如何"理解输入"并"生成对应输出"的关键机制！
+        # 交叉注意力权重反映了输入输出的对齐关系（Alignment）
+        cross_attn_output = self.attention.forward(x_norm, enc_out, enc_out)
+        #                                          ↑       ↑       ↑
+        #                                        Query    Key    Value
+        #                                       Decoder  Encoder Encoder
+
+        # 步骤3: 残差连接
+        # 将第1个子层的输出 x 加上交叉注意力的输出
+        h = x + cross_attn_output
+        # h 形状: [batch_size, tgt_seq_len, n_embd]
+        # h 现在包含：①已生成内容的信息（子层1） + ②输入序列的信息（子层2）
+
+        # ========== 子层 3: 前馈网络 + 残差连接 ==========
+        # 目的：对每个位置的表示进行独立的非线性变换，增强特征表达能力
+        # 前馈网络结构：Linear(扩展) -> ReLU -> Linear(压缩) -> Dropout
+
+        # 步骤1: LayerNorm 归一化
+        h_norm = self.ffn_norm(h)
+
+        # 步骤2: 前馈网络
+        # 每个词的表示独立处理（没有位置间的交互）
+        # 通过两层线性变换和激活函数，增加模型的非线性表达能力
+        ffn_output = self.feed_forward.forward(h_norm)
+
+        # 步骤3: 残差连接
+        out = h + ffn_output
+        # out 形状: [batch_size, tgt_seq_len, n_embd]
+        # out 包含：①自注意力信息 + ②交叉注意力信息 + ③前馈网络的变换
+        return out
+
+
 class Decoder(nn.Module):
-    pass
+    def __init__(self, args):
+        super(Decoder, self).__init__()
+        self.layers = nn.ModuleList([DecoderLayer(args) for _ in range(args.n_layer)])
+
+    def forward(self, x, enc_out):
+        """
+        前向传播，依次通过所有 Decoder 层
+
+        Args:
+            x: Decoder 输入，形状 [batch_size, tgt_seq_len, n_embd]
+            enc_out: Encoder 输出，形状 [batch_size, src_seq_len, n_embd]
+
+        Returns:
+            解码后的张量，形状 [batch_size, tgt_seq_len, n_embd]
+        """
+        # 依次通过每个 Decoder 层
+        for layer in self.layers:
+            x = layer(x, enc_out)
+        # 最后进行一次 LayerNorm
+        return self.norm(x)
 
 
 class Transformer(nn.Module):
