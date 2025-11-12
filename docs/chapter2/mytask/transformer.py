@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 import torch
 from torch import nn
+from torch.nn.functional import dropout
 from transformers import BertTokenizer
 import torch.nn.functional as F
 
@@ -315,6 +316,34 @@ class MultiHeadAttention(nn.Module):
         return output
 
 
+class MLP(nn.Module):
+    """
+    前馈神经网络
+    在Transformer中，Encoder和Decoder都包含一个前馈神经网络
+    它有由两个线性层构成，中间使用RelU函数激活，包含两个Dropout
+    """
+
+    def __init__(self, dim: int, hidden_dim: int, dropout: float):
+        super().__init__()
+        # 第一次线性变换，dim —> hidden_dim(扩展维度)
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        # 第二次线性变换，hidden_dim —> dim(恢复原始维度)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        # Dropout层，用于正则化，防止过拟合
+        self.dropout = self.dorpout
+
+    def forward(self, x):
+        """
+        前向传播
+        args:
+            x:输入张量，形状[dim,hidden_dim,dropout]
+        Returns:
+            输出张量，形状[dim,hidden_dim,dropout]
+        """
+        # x-> Linear(w1)->RelU->Linear(w2)->Dropout->output
+        return self.dropout(self.w2(F.relu(self.w1(x))))
+
+
 class EncoderLayer(nn.Module):
     """
     Encoder层
@@ -323,6 +352,7 @@ class EncoderLayer(nn.Module):
     2. 前馈神经网络
     每个子层都使用参差链接和归一化层
     结构：layerNorm->MultiHeadAttention->残差连接->layerNorm->FFM->残差连接
+    归一化-多头-参差连接-归一化-前馈-参差连接
     """
 
     def __init__(self, args):
@@ -346,9 +376,11 @@ class EncoderLayer(nn.Module):
         # # ✅ 可以看到 "I"（前面的词）
         # # ✅ 可以看到 "love"（当前的词）
         # # ✅ 可以看到 "learning"（后面的词）
-        # MultiHeadAttention()
-
-    pass
+        self.attention = MultiHeadAttention(args, is_causal=False)
+        # 第二个 LayerNorm，在前馈网络之前
+        self.fnn_norm = LayerNorm(args.n_embd)
+        # 前馈神经网络
+        self.feed_forward = MLP(args.dim, args.dim, args.dropout)
 
 
 class Encoder(nn.Module):
