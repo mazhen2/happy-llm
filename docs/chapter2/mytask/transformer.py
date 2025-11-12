@@ -181,7 +181,7 @@ class MultiHeadAttention(nn.Module):
         # 6. 数学原理：矩阵乘法的结合律 (AB)C = A(BC)
         self.wq = nn.Linear(args.n_embd, self.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.n_embd, self.n_heads * self.head_dim, bias=False)
-        self.wq = nn.Linear(args.n_embd, self.n_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(args.n_embd, self.n_heads * self.head_dim, bias=False)
 
         # 输出投影矩阵，将多头的结果投影回原始维度
         # 维度：（n_heads * head_dim）-> dim
@@ -321,6 +321,8 @@ class MLP(nn.Module):
     前馈神经网络
     在Transformer中，Encoder和Decoder都包含一个前馈神经网络
     它有由两个线性层构成，中间使用RelU函数激活，包含两个Dropout
+
+    结构: Linear -> ReLU -> Dropout -> Linear -> Dropout
     """
 
     def __init__(self, dim: int, hidden_dim: int, dropout: float):
