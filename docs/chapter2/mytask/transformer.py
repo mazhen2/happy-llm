@@ -6,7 +6,6 @@ from transformers import BertTokenizer
 import torch.nn.functional as F
 
 
-
 @dataclass
 class ModelArgs:
     """
@@ -572,6 +571,90 @@ class Transformer(nn.Module):
             # Decoder 模块
             decoder=Decoder(args)
         ))
+
+        # 语言模型头：将 Decoder 的输出投影到词表空间
+        # 输出维度为vocab_size,用于预测下一个token
+        self.lm_head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
+
+        # 初始化所有模型参数
+        self.apply(self._init_weights)
+
+    def forward(self, idx, targets=None):
+        """
+        Transformer 前向传播
+
+        Args:
+            idx: 输入 token ids，形状 [batch_size, seq_len]
+            targets: 目标 token ids（可选），用于训练时计算损失
+                    形状 [batch_size, seq_len]
+
+        Returns:
+            logits: 模型输出的 logits，形状 [batch_size, seq_len, vocab_size] 或
+                   [batch_size, 1, vocab_size]（推理时）
+            loss: 交叉熵损失（训练时），或 None（推理时）
+        """
+        # 获取输入的设备和形状信息
+        device = idx.device
+        b, t = idx.size()  # b: batch_size, t: seq_len
+
+        # 验证序列长度不超过最大限制
+        assert t <= self.args.block_size, \
+            f"不能计算该序列，该序列长度为 {t}, 最大序列长度只有 {self.args.block_size}"
+
+        # ===== 步骤 1: Token Embedding =====
+        # 将 token ids 转换为词向量
+        # 形状: [batch_size, seq_len] -> [batch_size, seq_len, n_embd]
+        print("idx", idx.size())
+        tok_emb = self.transformer.wte(idx)
+        print("tok_emb", tok_emb.size())
+
+        # ===== 步骤 2: 位置编码 =====
+        # 添加位置信息
+        # 形状保持: [batch_size, seq_len, n_embd]
+        pos_emb = self.transformer.wpe(tok_emb)
+
+        # ===== 步骤 3: Dropout =====
+        x = self.transformer.drop(pos_emb)
+        print("x after wpe:", x.size())
+
+        # ===== 步骤 4: Encoder =====
+        # 通过 Encoder 编码输入序列
+        # 形状保持: [batch_size, seq_len, n_embd]
+        enc_out = self.transformer.encoder(x)
+        print("enc_out:", enc_out.size())
+
+        # ===== 步骤 5: Decoder =====
+        # Decoder 接收编码后的表示和 Encoder 的输出
+        # 在这个简化实现中，Decoder 的输入也是 x（实际应用中可能是目标序列）
+        # 形状保持: [batch_size, seq_len, n_embd]
+        x = self.transformer.decoder(x, enc_out)
+        print("x after decoder:", x.size())
+
+        # ===== 步骤 6: 输出层 =====
+        if targets is not None:
+            # 训练模式：计算所有位置的 logits 和损失
+            # 将 Decoder 输出投影到词表空间
+            # 形状: [batch_size, seq_len, n_embd] -> [batch_size, seq_len, vocab_size]
+            logits = self.lm_head(x)
+
+            # 计算交叉熵损失
+            # 将 logits 和 targets 展平为 2D 和 1D
+            # logits: [batch_size * seq_len, vocab_size]
+            # targets: [batch_size * seq_len]
+            # ignore_index=-1: 忽略值为 -1 的位置（padding）
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1
+            )
+        else:
+            # 推理模式：只需要最后一个位置的 logits
+            # 使用 [-1] 而不是 -1 来保持时间维度
+            # 形状: [batch_size, 1, vocab_size]
+            logits = self.lm_head(x[:, [-1], :])
+            loss = None
+
+        return logits, loss
 
 
 def main():
