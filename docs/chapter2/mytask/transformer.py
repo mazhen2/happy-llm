@@ -1,3 +1,17 @@
+"""
+Transformer 完整实现
+
+本文件实现了完整的 Transformer 模型，包括：
+- 编码器（Encoder）：理解输入序列
+- 解码器（Decoder）：生成输出序列
+- 多头注意力机制（Multi-Head Attention）
+- 位置编码（Positional Encoding）
+- 层归一化（Layer Normalization）
+
+基于论文 "Attention is All You Need" (Vaswani et al., 2017)
+适用于序列到序列（Seq2Seq）任务，如机器翻译、文本摘要等
+"""
+
 import math
 from dataclasses import dataclass
 import torch
@@ -42,53 +56,60 @@ class ModelArgs:
         - GPT-2-small：n_embd=768, dim=768, n_heads=12, n_layer=12, max_seq_len=1024
     """
     n_embd: int  # 词向量维度
+    n_heads: int  # 多头注意力的头数
     dim: int  # 隐藏层维度
-    vocab_size: int  # 词表大小
-    n_head: int  # 多头注意力的头数
-    n_layer: int  # Encoder/decoder 层数
-    max_seq_len: int  # 最大序列长度,用于创建位置编码和掩码
-    block_size: int  # 输出序列最大长度，通常等于max_sel_len
     dropout: float  # 概率值，防止过拟合
+    max_seq_len: int  # 最大序列长度,用于创建位置编码和掩码
+    vocab_size: int  # 词表大小
+    block_size: int  # 输出序列最大长度，通常等于max_sel_len
+    n_layer: int  # Encoder/decoder 层数
 
 
 class PositionalEncoding(nn.Module):
+    """
+    位置编码（Positional Encoding）
+    
+    由于 Transformer 没有 RNN 的顺序处理特性，需要通过位置编码来注入位置信息。
+    使用正弦和余弦函数生成位置编码，具有以下优点：
+    1. 可以处理任意长度的序列
+    2. 不同位置的相对位置关系可以被模型学习
+    3. 不需要训练，是固定的
+    
+    公式：
+        PE(pos, 2i)   = sin(pos / 10000^(2i/d_model))
+        PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+    
+    其中 pos 是位置，i 是维度索引，d_model 是嵌入维度
+    
+    Args:
+        args: 模型配置参数
+    """
 
     def __init__(self, args):
         super().__init__()
-        # 创建位置编码矩阵，形状[block_size,n_emd]
+        # 创建位置编码矩阵，形状 [block_size, n_embd]
         pe = torch.zeros(args.block_size, args.n_embd)
-        # 创建位置索引[0,1,2,...,block-size-1],形状[block_size,1]
-        # 创建一个从 0 到 args.block_size-1 的整数序列
+
+        # 创建位置索引 [0, 1, 2, ..., block_size-1]，形状 [block_size, 1]
         position = torch.arange(0, args.block_size).unsqueeze(1)
 
-        # 计算位置编码的除数项（divisor term），用于实现 Transformer 论文中的位置编码公式
-        # 公式: PE(pos, 2i) = sin(pos / 10000^(2i/d_model))
-        #       PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
-        # 其中 pos 是位置，i 是维度索引，d_model 是嵌入维度
-
-        # 数学变换：1 / 10000^(2i/d_model) = exp(-2i/d_model * ln(10000))
-        # 因此 div_term = exp(arange(0, d_model, 2) * -(ln(10000) / d_model))
-
+        # 计算除数项 (div_term)
+        # 对于偶数维度 i: 10000^(2i/d_model) = exp(2i * log(10000) / d_model)
+        # 这里使用 exp 和 log 来避免数值溢出
+        # torch.arange(0, n_embd, 2) 生成 [0, 2, 4, ..., n_embd-2]
         div_term = torch.exp(
-            # torch.arange(0, args.n_embd, 2): 生成偶数索引 [0, 2, 4, 6, ...]，对应公式中的 2i
-            # 形状: [n_embd/2]，例如 n_embd=8 时生成 tensor([0, 2, 4, 6])
-
-            # -(math.log(10000.0) / args.n_embd): 缩放因子，值为 -ln(10000)/d_model
-            # 负号使得频率随维度递减：低维度→高频率（捕捉短距离），高维度→低频率（捕捉长距离）
-
-            # 整体相乘：arange * scale 得到指数值，例如 [0, -2.3, -4.6, -6.9]
-            # torch.exp(): 对指数求幂，得到除数项，例如 [1.0, 0.1, 0.01, 0.001]
-            # 这些除数让不同维度以不同频率编码位置信息
             torch.arange(0, args.n_embd, 2) * -(math.log(10000.0) / args.n_embd)
         )
-        # 对偶数位置使用sin,对奇数位置是cos
-        # pe[:, 0::2] 表示所有行，从第 0 列开始每隔 2 列取一个（即偶数列：0, 2, 4, 6, ...)
+
+        # 对偶数位置使用 sin，对奇数位置使用 cos
+        # pe[:, 0::2] 表示所有行，从第 0 列开始每隔 2 列取一个（即偶数列）
         pe[:, 0::2] = torch.sin(position * div_term)
-        # pe[:, 1::2] 表示所有行，从第 1 列开始每隔 2 列取一个（即奇数列：1, 3, 5, 7, ...)
+        # pe[:, 1::2] 表示所有行，从第 1 列开始每隔 2 列取一个（即奇数列）
         pe[:, 1::2] = torch.cos(position * div_term)
+
         # 增加 batch 维度：[block_size, n_embd] -> [1, block_size, n_embd]
-        # 添加 batch 维度：在第 0 维插入大小为 1 的维度，使位置编码能够与 3D 输入数据 [batch_size, seq_len, n_embd] 相加
         pe = pe.unsqueeze(0)
+
         # 将位置编码注册为 buffer
         # buffer 不会被当作模型参数，但会被保存在 state_dict 中
         self.register_buffer("pe", pe)
@@ -111,34 +132,47 @@ class PositionalEncoding(nn.Module):
 
 class LayerNorm(nn.Module):
     """
-    归一化层（layer Normalization）
-    与 Bach Layer 不同的是，layer Normalization 会对每个样本的所有维度的特征进行归一化
-    而不是对整个 Bach 的某一个特征进行归一化，这使得更适合序列模型（序列可变）和小Bach
-    公式: LayerNorm(x) = γ * (x - μ) / (σ + ε) + β
+    层归一化（Layer Normalization）
+    
+    与 Batch Normalization 不同，Layer Norm 对每个样本的所有特征进行归一化，
+    而不是对整个 batch 的同一个特征进行归一化。这使得它更适合序列模型和小 batch。
+    
+    公式：LayerNorm(x) = γ * (x - μ) / (σ + ε) + β
     其中 μ 和 σ 是在特征维度上计算的均值和标准差
-    args:
+    
+    Args:
         features: 特征维度大小
-        eps: 防止除0的小常数，默认1e-6
+        eps: 防止除零的小常数，默认 1e-6
     """
 
     def __init__(self, features, eps=1e-6):
         super().__init__()
-        # 可学习的缩放参数γ(gamma),初始值为1
+        # 可学习的缩放参数 γ（gamma），初始化为 1
         self.a_2 = nn.Parameter(torch.ones(features))
-        # 可学习的偏移参数β(bete),初始值为0
+        # 可学习的偏移参数 β（beta），初始化为 0
         self.b_2 = nn.Parameter(torch.zeros(features))
-        # epsilon: 防止除0的小数
+        # epsilon：防止除零的小常数
         self.eps = eps
 
     def forward(self, x):
-        # 计算最后一个维度(特征维度)的均值
-        # keepdim: 保持维度，便于广播
-        # mean: [bach_size,seq_len,1]
+        """
+        前向传播
+        
+        Args:
+            x: 输入张量，形状 [batch_size, seq_len, features]
+        
+        Returns:
+            归一化后的张量，形状与输入相同
+        """
+        # 计算最后一个维度（特征维度）的均值
+        # keepdim=True 保持维度，便于广播
+        # mean: [batch_size, seq_len, 1]
         mean = x.mean(-1, keepdim=True)
 
         # 计算最后一个维度的标准差
-        # std: [bach_size,seq_len,1]
+        # std: [batch_size, seq_len, 1]
         std = x.std(-1, keepdim=True)
+
         # 归一化：(x - μ) / (σ + ε)
         # 然后进行缩放和偏移：γ * normalized + β
         # 这里利用了广播机制，a_2 和 b_2 会自动扩展到匹配 x 的形状
@@ -162,50 +196,28 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, args: ModelArgs, is_causal=False):
         super().__init__()
         # 校验：隐藏层是多头自注意力头数的整数倍，因为我们后面会将输入平均拆分为 n_heads 个子空间
-        assert args.dim % args.n_head == 0
+        assert args.dim % args.n_heads == 0
         # 每个头的维度，等于模型隐藏层维度/头的总数
         # 例如：dim=512, n_heads=8, 则 head_dim=64
-        self.head_dim = args.dim // args.n_head
-        self.heads = args.n_head
+        self.head_dim = args.dim // args.n_heads
+        self.n_heads = args.n_heads
 
-        # 定义 Query,key,value 的线性变换矩阵
-        # 输入维度：n_embd,输出维度 head_dim * n_heads
+        # 定义 Query, Key, Value 的线性变换矩阵
+        # 输入维度：n_embd，输出维度：n_heads * head_dim
         # 这里通过一个大的线性层来代替 n_heads 个小的线性层
-
-        # 1. 作用：将输入投影成 Q、K、V
-        # 2. 输入维度：n_embd (如 512)
-        # 3. 输出维度：n_heads * head_dim (如 8×64=512)
-        # 4. bias=False：不使用偏置项
-        # 5. 高效实现：一个大线性层代替 8 个小线性层
-        # 6. 数学原理：矩阵乘法的结合律 (AB)C = A(BC)
+        # 原理：(AB)C = A(BC)，先分别变换再拼接 = 拼接后统一变换
         self.wq = nn.Linear(args.n_embd, self.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.n_embd, self.n_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.n_embd, self.n_heads * self.head_dim, bias=False)
 
         # 输出投影矩阵，将多头的结果投影回原始维度
-        # 维度：（n_heads * head_dim）-> dim
+        # 维度：(n_heads * head_dim) -> dim
         self.wo = nn.Linear(self.n_heads * self.head_dim, args.dim, bias=False)
 
-        # 注意力权重的Dropout,用于防止过拟合
-
-        # 多头注意力的输出（示例：512维向量）
-        # output = [0.5, 0.3, -0.2, 0.8, ..., 0.1]  # 512个数
-        #         ↑    ↑     ↑    ↑         ↑
-        #       特征1 特征2 特征3 特征4 ... 特征512
-        # 应用 Dropout (p=0.1)
-        # 随机丢弃 10% 的特征维度
-        # output = [0.56, 0, -0.22, 0.89, ..., 0]
-        #         ↑     ↓    ↑     ↑         ↓
-        #       保留  丢弃  保留  保留     丢弃
-        #      (放大)            (放大)
-        # 好处：
-        # ✅ 防止过度依赖某些特征维度
-        # ✅ 增强特征的鲁棒性
-        # ✅ 配合残差连接，稳定训练
-
-        self.attn_dropout = nn.Dropout(args.dropout)  # 📌 定义 Dropout 1
-        # 残差连接前的Dropout
-        self.resid_dropout = nn.Dropout(args.dropout)  # 📌 定义 Dropout 2
+        # 注意力权重的 Dropout，用于防止过拟合
+        self.attn_dropout = nn.Dropout(args.dropout)
+        # 残差连接前的 Dropout
+        self.resid_dropout = nn.Dropout(args.dropout)
         self.is_causal = is_causal
 
         # 如果是因果注意力（Decoder 中使用），需要创建一个上三角掩码矩阵
@@ -240,7 +252,6 @@ class MultiHeadAttention(nn.Module):
         # bsz: batch size（批次大小）
         # seqlen: sequence length（序列长度）
         # 输入形状: [batch_size, seq_len, n_embd]
-        # 只关心前两个维度，n_embd 是固定维度
         bsz, seqlen, _ = q.shape
 
         # 步骤 2: 线性变换得到 Q, K, V
@@ -256,14 +267,12 @@ class MultiHeadAttention(nn.Module):
         # - view 操作会按照内存顺序重新组织数据
         # - 先 view 再 transpose 可以确保每个头获得连续的特征维度
         # - 最终得到的形状便于进行批量矩阵乘法
-        # xq.view() 是 PyTorch 张量的reshape（重塑形状）方法，用于改变张量的形状而不改变数据内容
-        xq = xq.view(bsz, seqlen, self.heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.heads, self.head_dim)
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)  # (B, T, nh, hs)
+        xk = xk.view(bsz, seqlen, self.n_heads, self.head_dim)  # (B, T, nh, hs)
+        xv = xv.view(bsz, seqlen, self.n_heads, self.head_dim)  # (B, T, nh, hs)
 
         # 交换维度：将 n_heads 维度移到第二个位置
         # 从 (B, T, nh, hs) 变为 (B, nh, T, hs)
-        # transpose（转置）操作，用于交换张量的两个维度,为了让每个注意力头可以独立并行计算,因为这个维度都一样
         xq = xq.transpose(1, 2)  # (B, nh, T, hs)
         xk = xk.transpose(1, 2)  # (B, nh, T, hs)
         xv = xv.transpose(1, 2)  # (B, nh, T, hs)
@@ -317,124 +326,158 @@ class MultiHeadAttention(nn.Module):
 
 class MLP(nn.Module):
     """
-    前馈神经网络
-    在Transformer中，Encoder和Decoder都包含一个前馈神经网络
-    它有由两个线性层构成，中间使用RelU函数激活，包含两个Dropout
-
-    结构: Linear -> ReLU -> Dropout -> Linear -> Dropout
+    前馈神经网络（Feed-Forward Network / MLP）
+    
+    在 Transformer 中，每个 Encoder/Decoder 层都包含一个前馈网络。
+    它由两个线性层组成，中间使用 ReLU 激活函数。
+    
+    结构：Linear -> ReLU -> Linear -> Dropout
+    
+    Args:
+        dim: 输入和输出维度
+        hidden_dim: 隐藏层维度（通常是 dim 的 4 倍）
+        dropout: Dropout 概率
     """
 
     def __init__(self, dim: int, hidden_dim: int, dropout: float):
         super().__init__()
-        # 第一次线性变换，dim —> hidden_dim(扩展维度)
+        # 第一层线性变换：dim -> hidden_dim（扩展维度）
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        # 第二次线性变换，hidden_dim —> dim(恢复原始维度)
+        # 第二层线性变换：hidden_dim -> dim（恢复原始维度）
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        # Dropout层，用于正则化，防止过拟合
-        self.dropout = self.dorpout
+        # Dropout 层，用于正则化，防止过拟合
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         """
         前向传播
-        args:
-            x:输入张量，形状[dim,hidden_dim,dropout]
+        
+        Args:
+            x: 输入张量，形状 [batch_size, seq_len, dim]
+        
         Returns:
-            输出张量，形状[dim,hidden_dim,dropout]
+            输出张量，形状 [batch_size, seq_len, dim]
         """
-        # x-> Linear(w1)->RelU->Linear(w2)->Dropout->output
+        # 数据流：x -> Linear(w1) -> ReLU -> Linear(w2) -> Dropout -> output
+        # 这个两层结构允许模型学习更复杂的非线性变换
         return self.dropout(self.w2(F.relu(self.w1(x))))
 
 
 class EncoderLayer(nn.Module):
     """
-    Encoder层
-    每个Encoder层包含两个子层
-    1. 多头自注意力机制
-    2. 前馈神经网络
-    每个子层都使用参差链接和归一化层
-    结构：layerNorm->MultiHeadAttention->残差连接->layerNorm->FFM->残差连接
-    归一化-多头-参差连接-归一化-前馈-参差连接
+    Encoder 层
+    
+    每个 Encoder 层包含两个子层：
+    1. 多头自注意力机制（Multi-Head Self-Attention）
+    2. 前馈神经网络（Feed-Forward Network）
+    
+    每个子层都使用残差连接（Residual Connection）和层归一化（Layer Normalization）
+    结构：LayerNorm -> MultiHeadAttention -> 残差连接 -> LayerNorm -> FFN -> 残差连接
+    
+    Args:
+        args: 模型配置参数
     """
 
     def __init__(self, args):
         super().__init__()
-        # 第一个 layerNorm，在多头自注意力前
+        # 第一个 LayerNorm，在自注意力之前
         self.attention_norm = LayerNorm(args.n_embd)
-
-        # 为什么？因为输入句子是完整给出的！
-        # 我们有全部信息，没有理由不让模型看到所有内容
-        # 多头自注意力(不使用因果掩码，因为Encoder 可以看到所有位置)，因果掩码（Causal Mask / Attention Mask）是一种机制，用于防止模型在预测当前位置时"偷看"未来的信息。
-        # # 任务：英文翻译成中文
-        # 英文（输入） = "I love learning"
-        # 中文（输出） = "我 爱 学习"
-        #
-        # # ==================== Encoder 处理输入 ====================
-        # # Encoder 的任务：理解输入句子 "I love learning"
-        #
-        # input_tokens = ["I", "love", "learning"]
-        #
-        # # 当 Encoder 处理 "love" 这个词时：
-        # # ✅ 可以看到 "I"（前面的词）
-        # # ✅ 可以看到 "love"（当前的词）
-        # # ✅ 可以看到 "learning"（后面的词）
+        # 多头自注意力层（不使用因果掩码，因为 Encoder 可以看到所有位置）
         self.attention = MultiHeadAttention(args, is_causal=False)
         # 第二个 LayerNorm，在前馈网络之前
         self.fnn_norm = LayerNorm(args.n_embd)
         # 前馈神经网络
         self.feed_forward = MLP(args.dim, args.dim, args.dropout)
 
+    def forward(self, x):
+        """
+        前向传播
+        
+        Args:
+            x: 输入张量，形状 [batch_size, seq_len, n_embd]
+        
+        Returns:
+            输出张量，形状 [batch_size, seq_len, n_embd]
+        """
+        # 子层 1: 自注意力 + 残差连接
+        # Pre-LN 架构：先做 LayerNorm，再做注意力
+        x_norm = self.attention_norm(x)
+        # 自注意力：q, k, v 都来自同一个输入
+        # 使用残差连接：输出 = 输入 + 注意力结果
+        h = x + self.attention.forward(x_norm, x_norm, x_norm)
+
+        # 子层 2: 前馈网络 + 残差连接
+        # 同样使用 Pre-LN 架构
+        h_norm = self.fnn_norm(h)
+        out = h + self.feed_forward.forward(h_norm)
+        return out
+
 
 class Encoder(nn.Module):
+    """
+    Transformer Encoder
+    
+    Encoder 由多个 EncoderLayer 堆叠而成，用于处理输入序列。
+    在机器翻译任务中，Encoder 负责编码源语言序列。
+    
+    Args:
+        args: 模型配置参数
+    """
+
     def __init__(self, args):
         super(Encoder, self).__init__()
+        # 创建 N 个 Encoder 层并组成列表
         # nn.ModuleList 确保这些层的参数会被正确注册
         self.layers = nn.ModuleList([EncoderLayer(args) for _ in range(args.n_layer)])
-        # 最后的layerNorm层
+        # 最后的 LayerNorm 层
         self.norm = LayerNorm(args.n_embd)
 
     def forward(self, x):
         """
-        前向传播，依次通过所有Encoder层
-        args:
-            x：输入张量，形状[bach_size,seq_len_,n_embd]
+        前向传播，依次通过所有 Encoder 层
+        
+        Args:
+            x: 输入张量，形状 [batch_size, seq_len, n_embd]
+        
         Returns:
-            编码后的张量，形状[batch_size, seq_len, n_embd]
+            编码后的张量，形状 [batch_size, seq_len, n_embd]
         """
         # 依次通过每个 Encoder 层
         for layer in self.layers:
             x = layer(x)
-        # 最后进行一次LayerNorm
+        # 最后进行一次 LayerNorm
         return self.norm(x)
 
 
 class DecoderLayer(nn.Module):
     """
     Decoder 层
-    每个Decoder 都包含三个部分
-    1. 带掩码的多头自注意力机制
-    2. 多头交叉注意力，关注Encoder的输出
-    3. 前馈神经网络
-
-    每个子层都使用归一化和参差连接
-
+    
+    每个 Decoder 层包含三个子层：
+    1. 带掩码的多头自注意力（Masked Multi-Head Self-Attention）
+    2. 多头交叉注意力（Multi-Head Cross-Attention），关注 Encoder 的输出
+    3. 前馈神经网络（Feed-Forward Network）
+    
+    每个子层都使用残差连接和层归一化
+    
     Args:
-        args：模型配置参数
+        args: 模型配置参数
     """
 
     def __init__(self, args):
         super().__init__()
-        # 第一个LayerNorm：在掩码注意力之前
+        # 第一个 LayerNorm：在掩码自注意力之前
         self.attention_norm_1 = LayerNorm(args.n_embd)
-        # 掩码自注意力，防止当前位置看到未来的信息
+        # 掩码自注意力：防止当前位置看到未来的信息（is_causal=True）
         self.mask_attention = MultiHeadAttention(args, is_causal=True)
 
-        # 第二个LayerNorm：在交叉注意力之前
+        # 第二个 LayerNorm：在交叉注意力之前
         self.attention_norm_2 = LayerNorm(args.n_embd)
         # 交叉注意力：Query 来自 Decoder，Key 和 Value 来自 Encoder
         # 不需要掩码（is_causal=False），因为可以关注 Encoder 的所有位置
         self.attention = MultiHeadAttention(args, is_causal=False)
 
-        # 第三个LayerNorm：在前馈神经网络之前
+        # 第三个 LayerNorm：在前馈网络之前
         self.ffn_norm = LayerNorm(args.n_embd)
         # 前馈神经网络
         self.feed_forward = MLP(args.dim, args.dim, args.dropout)
@@ -516,9 +559,22 @@ class DecoderLayer(nn.Module):
 
 
 class Decoder(nn.Module):
+    """
+    Transformer Decoder
+    
+    Decoder 由多个 DecoderLayer 堆叠而成，用于生成输出序列。
+    在机器翻译任务中，Decoder 负责生成目标语言序列。
+    
+    Args:
+        args: 模型配置参数
+    """
+
     def __init__(self, args):
         super(Decoder, self).__init__()
+        # 创建 N 个 Decoder 层并组成列表
         self.layers = nn.ModuleList([DecoderLayer(args) for _ in range(args.n_layer)])
+        # 最后的 LayerNorm 层
+        self.norm = LayerNorm(args.n_embd)
 
     def forward(self, x, enc_out):
         """
@@ -539,45 +595,83 @@ class Decoder(nn.Module):
 
 
 class Transformer(nn.Module):
-    #     ↑          ↑
-    #   类名      父类（继承自）
     """
-    完整的transformer 模型
-    包含Encoder 和 Decoder的完整的transformer架构，适用于序列到序列任务
-    模型结构
-    输入->embedding-位置编码->encoder->decoder->输出投影->logits
-        输出投影是一个线性变换层（nn.linear）,作用是将 Decoder 的输出向量映射到词表空间
-        logits 是输出投影后得到的原始得分（未归一化的概率），表示每个词的"可能性得分"
+    完整的 Transformer 模型
+    
+    包含 Encoder 和 Decoder 的完整 Transformer 架构，适用于序列到序列任务。
+    模型结构：
+        输入 -> Embedding -> 位置编码 -> Encoder -> Decoder -> 输出投影 -> Logits
+    
     Args:
-        args:模型参数
+        args: 模型配置参数
     """
 
     def __init__(self, args):
         super().__init__()
-        assert args.vocab_size is not None, "必须指定词表大小"
-        assert args.block_size is not None, "必须指定最大序列长度"
+        # 验证必要参数
+        assert args.vocab_size is not None, "必须指定词表大小 (vocab_size)"
+        assert args.block_size is not None, "必须指定最大序列长度 (block_size)"
         self.args = args
 
-        # 构建transformer的各个组件
+        # 构建 Transformer 的各个组件
         self.transformer = nn.ModuleDict(dict(
-            # 词嵌入层，将token id转为向量
+            # 词嵌入层 (Word Token Embedding)：将 token ID 转换为向量
             wte=nn.Embedding(args.vocab_size, args.n_embd),
-            # 位置编码,添加位置信息
+            # 位置编码 (Word Position Embedding)：添加位置信息
             wpe=PositionalEncoding(args),
-            # Dropout层
-            dorp=nn.Dropout(args.dropout),
+            # Dropout 层
+            drop=nn.Dropout(args.dropout),
             # Encoder 模块
             encoder=Encoder(args),
             # Decoder 模块
-            decoder=Decoder(args)
+            decoder=Decoder(args),
         ))
 
         # 语言模型头：将 Decoder 的输出投影到词表空间
-        # 输出维度为vocab_size,用于预测下一个token
+        # 输出维度为 vocab_size，用于预测下一个 token
         self.lm_head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
 
         # 初始化所有模型参数
         self.apply(self._init_weights)
+
+        # 打印模型参数数量
+        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
+
+    def get_num_params(self, non_embedding=False):
+        """
+        统计模型参数数量
+        
+        Args:
+            non_embedding: 如果为 True，不统计 embedding 层的参数
+        
+        Returns:
+            参数总数
+        """
+        # 计算所有参数的数量
+        n_params = sum(p.numel() for p in self.parameters())
+        # 如果不统计 embedding，就减去 embedding 的参数量
+        if non_embedding:
+            n_params -= self.transformer.wte.weight.numel()
+        return n_params
+
+    def _init_weights(self, module):
+        """
+        初始化模型权重
+        
+        使用正态分布初始化线性层和 Embedding 层的权重
+        
+        Args:
+            module: 要初始化的模块
+        """
+        if isinstance(module, nn.Linear):
+            # 线性层权重初始化为正态分布 N(0, 0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            # 偏置初始化为 0
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            # Embedding 层权重也初始化为正态分布 N(0, 0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         """
@@ -658,29 +752,41 @@ class Transformer(nn.Module):
 
 
 def main():
+    """
+    主函数：演示如何使用 Transformer 模型
+    
+    这个示例展示了：
+    1. 如何创建模型配置
+    2. 如何使用 tokenizer 处理文本
+    3. 如何运行模型前向传播
+    4. 如何从输出中提取预测结果
+    """
+    # ===== 步骤 1: 创建模型配置 =====
     args = ModelArgs(
-        n_embd=100,
-        dim=100,
-        vocab_size=1000,
-        n_head=10,
-        n_layer=2,
-        max_seq_len=512,
-        block_size=1000,
-        dropout=0.1
+        n_embd=100,  # 嵌入维度
+        n_heads=10,  # 注意力头数
+        dim=100,  # 模型维度
+        dropout=0.1,  # Dropout 比例
+        max_seq_len=512,  # 最大序列长度
+        vocab_size=1000,  # 词表大小（将由 tokenizer 更新）
+        block_size=1000,  # 块大小
+        n_layer=2  # Encoder/Decoder 层数
     )
 
+    # ===== 步骤 2: 准备输入文本 =====
     text = "我喜欢快乐的学习大模型"
-    # BertTokenizer 是 huggingface transformers 库里用于对文本进行分词和编码的分词器类
-    # from_pretrained 是其常用的类方法，用于加载官方预训练好的分词器配置和词表
-    # 例如这里加载"bert-base-chinese"模型的分词器，可以将中文句子切分成BERT需要的token id
+
+    # ===== 步骤 3: 使用 tokenizer 处理文本 =====
+    # 使用 BERT 中文 tokenizer 进行分词
     tokenizer = BertTokenizer.from_pretrained("bert-base-chinese")
 
-    # 这段代码的参数作用解释如下：
-    # - text: 需要分词和编码的原始文本。
-    # - return_tensors='pt': 返回结果以 PyTorch 的 tensor 形式；适用于后续模型输入。
-    # - max_length: 指定输出的序列最大长度（超过会被截断，短于则补齐）；这里用 args.max_seq_len 控制。
-    # - truncation=True: 超过 max_length 的文本会被截断，防止序列过长。
-    # - padding='max_length': 不足 max_length 的输入会自动填充（pad）到统一长度，便于批量处理。
+    # 将文本转换为 token IDs
+    # 参数说明：
+    #   - text: 需要分词和编码的原始文本
+    #   - return_tensors='pt': 返回 PyTorch 张量格式
+    #   - max_length: 序列最大长度（超过会被截断）
+    #   - truncation=True: 启用截断
+    #   - padding='max_length': 填充到最大长度
     inputs_token = tokenizer(
         text,
         return_tensors='pt',
@@ -689,12 +795,68 @@ def main():
         padding='max_length'
     )
 
-    # 因为有时我们初始化ModelArgs时还没加载分词器（tokenizer），这时暂时给vocab_size赋一个默认值。
-    # 加载分词器后，可以获得其实际词表大小（tokenizer.vocab_size），然后再更新到args里，确保模型和分词器词表数量一致。
+    # ===== 步骤 4: 更新模型配置 =====
+    # 更新 vocab_size 为 tokenizer 的实际词表大小
+    # 确保模型和分词器的词表数量一致
     args.vocab_size = tokenizer.vocab_size
 
+    # ===== 步骤 5: 创建 Transformer 模型 =====
     transformer = Transformer(args)
 
+    # ===== 步骤 6: 前向传播 =====
+    # 获取输入的 token IDs
+    inputs_id = inputs_token['input_ids']
 
-if __name__ == "main__":
+    # 前向传播（推理模式，不计算损失）
+    logits, loss = transformer.forward(inputs_id)
+
+    # ===== 步骤 7: 处理输出 =====
+    print("\n" + "="*50)
+    print("模型输出结果")
+    print("="*50)
+    
+    # 打印 logits 的形状信息
+    print(f"Logits 形状: {logits.shape}")
+    print(f"  解释: [batch_size={logits.size(0)}, seq_len={logits.size(1)}, vocab_size={logits.size(2)}]")
+    
+    # 从 logits 中提取预测的 token ID
+    # argmax 找出概率最高的 token
+    predicted_id = torch.argmax(logits, dim=-1).squeeze().item()
+    print(f"\n预测的 token ID: {predicted_id}")
+    
+    # 解码单个 token
+    predicted_token = tokenizer.decode([predicted_id])
+    print(f"预测的 token: {predicted_token}")
+    
+    # 注意事项
+    print("\n" + "="*50)
+    print("⚠️  注意")
+    print("="*50)
+    print("1. 模型是随机初始化的，未经过训练")
+    print("2. 预测结果是随机的，没有实际意义")
+    print("3. '##' 前缀表示这是一个子词（subword）")
+    print("4. 需要训练模型才能得到有意义的预测")
+    
+    # 额外展示：输入文本的 token 化结果
+    print("\n" + "="*50)
+    print("输入文本的 Tokenization 结果")
+    print("="*50)
+    print(f"原始文本: {text}")
+    print(f"Token IDs: {inputs_id[0][:20].tolist()}...")  # 只显示前20个
+    
+    # 解码查看前几个 token
+    print(f"\n前5个 token 的解码:")
+    for i in range(min(5, inputs_id.size(1))):
+        token_id = inputs_id[0, i].item()
+        token_text = tokenizer.decode([token_id])
+        print(f"  位置 {i}: ID={token_id:5d} → '{token_text}'")
+
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("开始运行 Transformer 示例")
+    print("=" * 50)
     main()
+    print("=" * 50)
+    print("运行完成")
+    print("=" * 50)
