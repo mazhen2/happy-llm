@@ -1,4 +1,6 @@
 import torch
+import math
+import torch.nn.functional as F
 from transformers import PreTrainedModel, AutoTokenizer
 from transformers import PretrainedConfig
 from typing import Any, Optional, Tuple
@@ -49,11 +51,340 @@ class ModelConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-class Attention(nn.Module):
-    def __init__(self, args: ModelConfig):
-        super().__init__()
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    """
+    将频率张量重塑为可以与输入张量进行广播的形状
 
-    pass
+    此函数用于将预计算的频率矩阵（freqs_cis）调整为与输入张量x兼容的形状，
+    以便在应用旋转位置编码时能够正确进行广播操作。
+
+    广播规则：
+        - freqs_cis的原始形状为 (seq_len, head_dim//2)
+        - x的形状通常为 (batch_size, seq_len, n_heads, head_dim)
+        - 需要将freqs_cis重塑为 (1, seq_len, 1, head_dim//2) 以匹配x的形状
+
+    Args:
+        freqs_cis: 频率张量，形状为 (seq_len, head_dim//2)
+        x: 输入张量，形状为 (batch_size, seq_len, ..., head_dim)
+
+    Returns:
+        重塑后的频率张量，形状为 (1, seq_len, 1, ..., head_dim//2)
+    """
+    # 获取x的维度数
+    ndim = x.ndim
+    # 断言，确保维度数至少为2（需要序列维度和特征维度）
+    assert 0 <= 1 < ndim
+    # 断言，确保freqs_cis的形状与x的第二维（序列维度）和最后一维（特征维度）匹配
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+
+    # 构造新的形状：除了第二维（序列维度）和最后一维（特征维度），其他维度都设为1
+    # 这样可以在batch和head维度上进行广播
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+
+    # 将freqs_cis调整为新的形状，并返回
+    return freqs_cis.view(shape)
+
+
+def apply_rotary_emb(
+        xq: torch.Tensor,
+        xk: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    应用旋转位置编码（RoPE）到查询和键向量
+
+    旋转位置编码通过复数旋转的方式将位置信息编码到向量中。
+    对于维度为d的向量，将其视为d/2个复数对，每个复数对进行旋转。
+
+    旋转公式（对于复数 z = a + bi）：
+        z' = z * e^(iθ) = (a + bi) * (cos(θ) + i*sin(θ))
+        = (a*cos(θ) - b*sin(θ)) + i*(a*sin(θ) + b*cos(θ))
+
+    实部：a' = a*cos(θ) - b*sin(θ)
+    虚部：b' = a*sin(θ) + b*cos(θ)
+
+    Args:
+        xq: 查询向量，形状为 (batch_size, seq_len, n_heads, head_dim)
+        xk: 键向量，形状为 (batch_size, seq_len, n_kv_heads, head_dim)
+        freqs_cos: 余弦频率矩阵，形状为 (seq_len, head_dim//2)
+        freqs_sin: 正弦频率矩阵，形状为 (seq_len, head_dim//2)
+
+    Returns:
+        xq_out: 应用旋转后的查询向量，形状与xq相同
+        xk_out: 应用旋转后的键向量，形状与xk相同
+    """
+    # 将查询和键张量转换为浮点数，并重塑形状以分离实部和虚部
+    # reshape(..., -1, 2) 将最后一个维度分成两半，每两个连续元素组成一个复数对
+    # unbind(-1) 将最后一维分离，得到实部和虚部
+    xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
+    xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
+
+    # 重新塑形频率张量以进行广播，使其形状与xq_r和xk_r兼容
+    freqs_cos = reshape_for_broadcast(freqs_cos, xq_r)
+    freqs_sin = reshape_for_broadcast(freqs_sin, xq_r)
+
+    # 应用旋转矩阵变换
+    # 对于复数 z = a + bi，旋转后的实部：a' = a*cos(θ) - b*sin(θ)
+    # 旋转后的虚部：b' = a*sin(θ) + b*cos(θ)
+    xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin  # 查询向量的实部
+    xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos  # 查询向量的虚部
+    xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin  # 键向量的实部
+    xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos  # 键向量的虚部
+
+    # 将实部和虚部重新组合，还原为原始张量的形状
+    # stack 将实部和虚部堆叠在一起，flatten(3) 将最后两个维度展平
+    xq_out = torch.stack([xq_out_r, xq_out_i], dim=-1).flatten(3)
+    xk_out = torch.stack([xk_out_r, xk_out_i], dim=-1).flatten(3)
+
+    # 将数据类型转换回原始类型（可能是half或bfloat16）
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    重复键值对头，用于实现分组查询注意力（GQA）
+
+    在GQA中，查询头数（n_heads）通常大于键值头数（n_kv_heads）。
+    为了匹配查询头的数量，需要将每个键值头重复 n_rep = n_heads // n_kv_heads 次。
+
+    例如：
+        - n_heads = 8, n_kv_heads = 2, n_rep = 4
+        - 每个KV头会被重复4次，使得KV头的总数等于Q头的数量
+
+    Args:
+        x: 键或值张量，形状为 (batch_size, seq_len, n_kv_heads, head_dim)
+        n_rep: 重复次数，等于 n_heads // n_kv_heads
+
+    Returns:
+        重复后的张量，形状为 (batch_size, seq_len, n_kv_heads * n_rep, head_dim)
+    """
+    # 获取输入张量的形状：批量大小、序列长度、键/值对头的数量、每个头的维度大小
+    bs, slen, n_kv_heads, head_dim = x.shape
+
+    # 如果重复次数为1，则不需要重复，直接返回原始张量
+    if n_rep == 1:
+        return x
+
+    # 对张量进行扩展和重塑操作以重复键值对
+    # 步骤1：在第四个维度（头的维度前）添加一个新的维度
+    #       形状从 (bs, slen, n_kv_heads, head_dim) 变为 (bs, slen, n_kv_heads, 1, head_dim)
+    # 步骤2：将新添加的维度扩展到n_rep大小，实现重复的效果
+    #       形状变为 (bs, slen, n_kv_heads, n_rep, head_dim)
+    # 步骤3：重新塑形，合并键/值对头的数量和重复次数的维度
+    #       形状变为 (bs, slen, n_kv_heads * n_rep, head_dim)
+    return (
+        x[:, :, :, None, :]  # 添加新维度
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)  # 扩展维度
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)  # 重塑形状
+    )
+
+
+class Attention(nn.Module):
+    """
+    多头注意力机制（Multi-head Attention）,支持分组查询注意力（GQA）
+
+    本实现包含以下特性：
+    1. 分组查询注意力（GQA）；查询头数可以大于键值头数，减少KV缓存
+    2. 旋转位置编码（RoPE）: 通过旋转矩阵编码位置信息
+    3. Flash Attention支持：使用PyTorch 2.0+的优化注意力实现
+    4. 因果掩码：确保模型只能看到当前位置的信息
+
+    注意力计算公式：
+        Attention(Q,K,V) = softmax(QK^T / sqrt(d_k)) * V
+
+    其中：
+        - Q: 查询矩阵，形状为 (batch, n_heads, seq_len, head_dim)
+        - K: 键矩阵，形状为 (batch, n_kv_heads, seq_len, head_dim)
+        - V: 值矩阵，形状为 (batch, n_kv_heads, seq_len, head_dim)
+    """
+
+    def __init__(self, args: ModelConfig):
+        """
+        初始化注意力层
+
+        Args:
+            args: 模型配置对象，包含所有超参数
+        """
+        super().__init__()
+        # 根据是否指定n_kv_heads,确定键(key)和值(value)的头的数量
+        # 若未指定，则使用与查询头相同的数量(标准多头注意力)
+        # 托指定且小于n_heads,则使用GQA(分组查询注意力)
+
+        # GQA（Grouped Query Attention）是一种多头注意力的变体，用来减少键和值的计算和显存成本。
+        # 传统多头注意力：每个查询头都有对应的键和值头，头数相同。
+        # GQA：查询头仍保持较多，但键和值的头数被减少，让多个查询头共享同一组键 / 值。这样在计算 K、V 时只需较少的矩阵乘法，也减少了缓存 / 显存。
+        # 之所以可行，是因为 K、V 的表示通常具有较强的冗余性——在不同头之间，键和值往往编码的是类似的上下文信息。
+
+        # 普通 MHA: 8个查询头 → 8个键头 / 8个值头
+        # GQA: 8个查询头 → 2个键头 / 2个值头（共享）
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+
+        # 确保总头数可以被键值头数整除，这样才能正确实现GQA
+        # 例如：n_heads=8, n_kv_heads=2，则每个KV头对应4个Q头
+        assert args.n_heads % self.n_kv_heads == 0
+
+        # 模型并行处理大小，默认为1（单GPU训练）
+        # 在多GPU训练时，可以设置为GPU数量，将注意力头分配到不同GPU
+        model.parallel_size = 1
+
+        # 本地键值头数，等于键值头数除以模型并行处理大小
+        self.n_local_kv_heads = self.n_kv_heads // model.parallel_size
+
+        # 重复次数，用于扩展键和值的尺寸以匹配查询头的数量
+        # 例如：n_local_heads=8, n_local_kv_heads=2, 则n_rep=4
+        # 每个KV头会被重复4次
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+
+        # 每个头的维度，等于模型维度除以头的总数
+        # 确保总维度 = n_heads * head_dim = dim
+        self.head_dim = args.dim // args.n_heads
+
+        # 定义查询（Query）投影矩阵，将输入从dim维度映射到n_heads个head_dim维度
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+
+        # 定义键（Key）投影矩阵，将输入从dim维度映射到n_kv_heads个head_dim维度
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+
+        # 定义值（Value）投影矩阵，将输入从dim维度映射到n_kv_heads个head_dim维度
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+
+        # 输出投影矩阵，将所有注意力头的输出合并并映射回dim维度
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+
+        # 注意力分数dropout,在注意力权重后应用，防止过拟合
+        self.attn_dropout = nn.Dropout(args.dropout)
+
+        # 参差连接后的dropout,在输出投影后应用
+        self.resid_dropout = nn.Dropout(args.dropout)
+
+        # 保存 dropout概率，用于Flash Attention
+        # nn.Dropout()是一个函数式实现，它需要你以数值参数的形式把 dropout_p 传进去，而不是直接用模块里的 nn.Dropout 对象
+        self.dropout = args.dropout
+
+        # 检查是否使用Flash Attention（需要PyTorch >= 2.0）
+        # Flash Attention通过分块计算和在线softmax优化，大幅减少内存占用和计算时间
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+
+        if not self.flash:
+            # 若不支持Flash Attention，则使用手动实现的注意力机制，并设置mask
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+
+            # 创建因果掩码（上三角矩阵），用于遮蔽未来信息
+            # 形状为 (1, 1, max_seq_len, max_seq_len)
+            # 上三角部分为-inf，下三角和主对角线为0
+            mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
+            mask = torch.triu(mask, diagonal=1)  # 保留上三角部分（不包括主对角线）
+
+            # 注册为模型的缓冲区，这样会被包含在state_dict中，但不会被视为可训练参数
+            self.register_buffer("mask", mask)
+
+    def forward(self, x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor):
+        """
+        前向传播
+
+        计算流程：
+        1. 通过线性投影得到 Q,K,V
+        2. 应用旋转位置编码（RoPE）
+        3. 重复KV以匹配Q头数量
+        4. 计算注意力分数并应用softmax
+        5. 加权求和得到输出
+        6. 通过输出投影层
+
+        Args:
+            x: 输入张量，形状为 (batch_size, seq_len, dim)
+            freqs_cos: 余弦频率矩阵，形状为 (seq_len, head_dim//2)
+            freqs_sin: 正弦频率矩阵，形状为 (seq_len, head_dim//2)
+
+        head_dim//2:
+        freqs_cos（以及配套的 freqs_sin）是给 RoPE（旋转位置编码）用的。
+        RoPE 会把每个注意力头的 hidden dimension 拆成一对一对的二维向量来做旋转，每一对共用一个频率（对应正弦、余弦一对值）。
+        因此需要把 head_dim 除以 2，得到“有多少对二维向量”，也就是需要多少个余弦/正弦频率。举例：
+        如果 head_dim = 128，那就有 128 / 2 = 64 对二维向量；
+
+        Returns:
+            注意力输出，形状为 (batch_size, seq_len, dim)
+        """
+
+        # 获取批次大小和序列长度
+        # x的形状：[batch_size, seq_len, dim]
+        bsz, seqlen, _ = x.shape
+
+        # 步骤1：通过线性投影计算查询（Q）、键（K）、值（V）
+        # Q: (bsz, seqlen, n_heads * head_dim)
+        # K: (bsz, seqlen, n_kv_heads * head_dim)
+        # V: (bsz, seqlen, n_kv_heads * head_dim)
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        # 步骤2：调整形状以适应多头注意力的结构
+        # 将最后一个维度分割成多个头
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        # 步骤3：应用旋转位置嵌入（RoPE）到查询和键向量
+        # RoPE将位置信息编码到向量中，使得注意力能够感知相对位置
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
+
+        # 步骤4：对键和值进行扩展以适应重复次数（GQA）
+        # 如果n_kv_heads < n_heads，需要重复KV头以匹配Q头的数量
+        xk = repeat_kv(xk, self.n_rep)
+        xv = repeat_kv(xv, self.n_rep)
+
+        # 步骤5：将头维度移到批次维度之后，便于批量计算注意力
+        # 从 (bsz, seqlen, n_heads, head_dim) 变为 (bsz, n_heads, seqlen, head_dim)
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+
+        # 步骤6：计算注意力
+        if self.flash:
+            # 使用Flash Attention（PyTorch 2.0+）
+            # Flash Attention通过分块计算和在线softmax优化，减少内存占用
+            # is_causal=True 自动应用因果掩码
+            output = torch.nn.functional.scaled_dot_product_attention(
+                xq, xk, xv,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0.0, # 在训练模式才按配置的概率做 dropout，推理/评估时则设为 0，避免随机性
+                is_causal=True
+            )
+        else:
+            # 手动实现注意力机制（兼容旧版本PyTorch）
+            # 步骤6.1：计算注意力分数 QK^T / sqrt(d_k)
+            # xq: (bsz, n_heads, seqlen, head_dim)
+            # xk: (bsz, n_kv_heads, seqlen, head_dim) -> transpose后 (bsz, n_kv_heads, head_dim, seqlen)
+            # scores: (bsz, n_heads, seqlen, seqlen)
+            scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+            # 步骤6.2：应用因果掩码，遮蔽未来信息
+            # 将上三角部分设为-inf，softmax后这些位置的权重为0
+            assert hasattr(self, 'mask')
+            scores = scores + self.mask[:, :, :seqlen, :seqlen]
+
+            # 步骤6.3：应用softmax得到注意力权重
+            # 使用float类型计算以提高数值稳定性，然后转回原类型
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+
+            # 步骤6.4：应用dropout（仅在训练时）
+            scores = self.attn_dropout(scores)
+
+            # 步骤6.5：加权求和，得到注意力输出
+            # scores: (bsz, n_heads, seqlen, seqlen)
+            # xv: (bsz, n_kv_heads, seqlen, head_dim)
+            # output: (bsz, n_heads, seqlen, head_dim)
+            output = torch.matmul(scores, xv)
+
+        # 步骤7：恢复原始维度顺序并合并所有头
+        # 从 (bsz, n_heads, seqlen, head_dim) 变为 (bsz, seqlen, n_heads * head_dim)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+
+        # 步骤8：通过输出投影层，将所有头的输出合并并映射回原始维度
+        output = self.wo(output)
+
+        # 步骤9：应用残差dropout（仅在训练时）
+        output = self.resid_dropout(output)
+
+        return output
 
 
 class MLP(nn.Module):
