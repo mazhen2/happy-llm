@@ -483,10 +483,75 @@ class MLP(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float):
-        super().__init__()
+    """
+    RMSNorm (Root Mean Square Layer Normalization)
 
-    pass
+    RMSNorm是LayerNorm的简化版本，只对输入进行归一化而不减去均值。
+    相比LayerNorm，RMSNorm计算更简单，但效果相当。
+
+    数学公式：
+        RMS(x) = sqrt(mean(x^2))
+        RMSNorm(x) = (x / RMS(x)) * weight
+
+    优点：
+        1. 计算效率更高（不需要计算均值）
+        2. 数值稳定性更好
+        3. 在大多数任务上效果与LayerNorm相当
+    """
+
+    def __init__(self, dim: int, eps: float):
+        """
+        初始化RMSNorm层
+
+        Args:
+            dim: 输入特征的维度
+            eps: 防止除零的小常数，通常设为1e-5或1e-6
+        """
+        super().__init__()
+        # eps是为了防止除以0的情况，当输入全为0时避免数值不稳定
+        self.eps = eps
+        # weight是一个可学习的参数，全部初始化为1
+        # 用于在归一化后对特征进行缩放，允许模型学习合适的特征尺度
+        # nn.Parameter() 将张量注册为模型参数，会被优化器更新
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        """
+        计算RMSNorm的核心归一化操作
+
+        步骤：
+        1. 计算输入x在最后一个维度上的平方均值：mean(x^2)
+        2. 计算平方根的倒数：1/sqrt(mean(x^2) + eps)
+        3. 将输入x乘以归一化因子
+
+        Args:
+            x: 输入张量，形状为 (..., dim)
+
+        Returns:
+            归一化后的张量，形状与输入相同
+        """
+        # x.pow(2).mean(-1, keepdim=True) 计算输入x在最后一个维度上的平方均值
+        # torch.rsqrt 是平方根的倒数（1/sqrt），比先sqrt再除更高效
+        # 加上eps防止分母为0，保证数值稳定性
+        # 最后乘以x，得到归一化后的结果
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        """
+        前向传播
+
+        Args:
+            x: 输入张量，可以是任意形状，但最后一个维度必须是dim
+
+        Returns:
+            归一化并缩放后的张量，形状与输入相同
+        """
+        # 首先将输入x转为float类型进行计算，提高数值精度
+        # 然后进行RMSNorm归一化
+        # 最后转回原来的数据类型（可能是half或bfloat16）
+        # 乘以可学习的weight参数，允许模型调整特征尺度
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
 
 
 class DecoderLayer(nn.Module):
