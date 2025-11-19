@@ -345,7 +345,7 @@ class Attention(nn.Module):
             output = torch.nn.functional.scaled_dot_product_attention(
                 xq, xk, xv,
                 attn_mask=None,
-                dropout_p=self.dropout if self.training else 0.0, # 在训练模式才按配置的概率做 dropout，推理/评估时则设为 0，避免随机性
+                dropout_p=self.dropout if self.training else 0.0,  # 在训练模式才按配置的概率做 dropout，推理/评估时则设为 0，避免随机性
                 is_causal=True
             )
         else:
@@ -388,10 +388,98 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, multiple_of: int, dropout: float):
-        super().__init__()
+    """
+    多层感知机制（MLP）,使用SwiGlu激活函数
+    SwiGLU (Swish-Gated Linear Unit) 是GLU的变体，结合了Swish激活函数和门控机制。
 
-    pass
+    公式：
+        SwiGLU(x) = Swish(W1(x)) ⊙ W3(x)
+        output = W2(SwiGLU(x))
+
+    其中：
+        - Swish(x) = x * sigmoid(x)
+        - ⊙ 表示逐元素乘法（Hadamard积）
+        - W1, W2, W3 是线性变换层
+
+    优点：
+        1. 门控机制允许模型学习更复杂的非线性变换
+        2. Swish激活函数平滑且可导，训练更稳定
+        3. 相比标准ReLU，表达能力更强
+    """
+
+    def __init__(self, dim: int, hidden_dim: int, multiple_of: int, dropout: float):
+        """
+        初始化MLP层
+
+        Args:
+            dim: 输入和输出的维度
+            hidden_dim: 隐藏层维度，如果为None则自动计算
+            multiple_of: 隐藏层维度必须是该值的倍数（用于优化） 为了计算效率——GPU/TPU 上的矩阵乘法在特定的块大小（比如 64、128）整除时速度更快
+            dropout: Dropout概率
+        """
+        super().__init__()
+        # 若没有指定隐藏层维度，按LLaMA的方式自动计算
+        if hidden_dim is None:
+            # 首先设置为输入维度的4倍（标准Transformer的做法）
+            hidden_dim = 4 * dim
+            # 然后减少到2/3（LLaMA的优化）
+            hidden_dim = int(2 * hidden_dim / 3)
+            # 最后确保它是multiple_of的倍数，便于硬件优化（如GPU对齐）
+            # 使用向上取整的方式：((hidden_dim + multiple_of - 1) // multiple_of) * multiple_of
+            hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
+        # 第一层线性变换：从输入维度到隐藏维度
+        # 用于Swish激活函数的输入
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+
+        # 第二层线性变换：从隐藏维度回到输入维度
+        # 用于输出投影
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+
+        # 第三层线性变换：从输入维度到隐藏维度
+        # 用于门控（gate）机制
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+
+        # Dropout层，用于防止过拟合
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        """
+        前向传播
+
+        计算流程：
+        1. x通过w1得到h1，应用Swish激活函数
+        2. x通过w3得到h3（门控信号）
+        3. h1和h3逐元素相乘（门控机制）
+        4. 结果通过w2投影回原始维度
+        5. 应用dropout
+
+        Args:
+            x: 输入张量，形状为 (batch_size, seq_len, dim)
+
+        Returns:
+            输出张量，形状为 (batch_size, seq_len, dim)
+        """
+        # Swish激活函数：Swish(x) = x * sigmoid(x)
+        # self.w1(x) 把输入 x 映射到更高维的隐层空间，然后用 F.silu（PyTorch 里的 Swish）做非线性激活：
+        # h1 = Swish(w1(x)) = w1(x) * sigmoid(w1(x))
+
+        # 门控机制：将Swish(w1(x))与w3(x)逐元素相乘
+        # self.w3(x) 也把 x 映射到同样的隐层维度，但不做激活，直接作为门控向量 h3。
+
+        # h1 * h3 就是 SwiGLU 的核心：Swish(w1(x)) ⊙ w3(x)。
+        # 门控向量决定每个隐层通道的开放程度，可以理解为为每个特征通道加了一扇“门”，让网络学到更细粒度的控制。
+
+        # eg.
+        # # 对于每个位置 (i, j, k)：output[i, j, k] = h1[i, j, k] * h3[i, j, k]
+        # h3 的每个元素作为一个“开关系数”，控制 h1 对应位置的信息通过量：
+        # h3[k] ≈ 0：关闭，h1[k] 的信息几乎被抑制
+        # h3[k] ≈ 1：全开，h1[k] 的信息几乎全部通过
+        # h3[k] > 1：放大，h1[k] 的信息被增强
+        # h3[k] < 0：反向，h1[k] 的信息被反转
+
+        # 最后通过w2投影并应用dropout
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 
 class RMSNorm(nn.Module):
