@@ -1068,6 +1068,86 @@ class Transformer(PreTrainedModel):
         # [:, seq_len:] 切片只保留生成部分
         return beams[0][:, seq_len:]
 
+    @torch.inference_mode()
+    def generate_super(self,
+                       idx,
+                       stop_id=None,
+                       max_new_tokens=256,
+                       temperature=1.0,
+                       top_k=None,
+                       do_sample=False,
+                       num_beams=1
+                       ):
+        """
+        高级文本生成函数，支持三种解码策略：
+
+        1. 贪婪解码（Greedy Search）：
+           - 参数：do_sample=False, num_beams=1
+           - 特点：每步选择概率最大的token，速度快、结果确定
+
+        2. 随机采样（Random Sampling）：
+           - 参数：do_sample=True, num_beams=1
+           - 特点：基于概率分布随机采样，可配合temperature和top-k控制多样性
+
+        3. 束搜索（Beam Search）：
+           - 参数：do_sample=False, num_beams>1
+           - 特点：维护多条候选路径，选择总概率最高的序列，质量更高但速度较慢
+
+        Args:
+            idx: 输入序列张量，形状为 (batch_size, seq_len)
+            stop_id: 停止生成的token ID
+            max_new_tokens: 最大生成token数量
+            temperature: 温度参数，控制随机性，越高越随机
+            top_k: 只考虑概率最高的k个token，None表示不考虑
+            do_sample: 是否使用随机采样，False时使用确定性解码
+            num_beams: 束搜索的束宽度，1表示不使用束搜索
+
+        Returns:
+            生成的token序列，形状为 (batch_size, generated_length)
+        """
+        # 参数验证
+        if temperature <= 0:
+            temperature = 0.001  # 避免除零错误
+        if num_beams < 1:
+            num_beams = 1
+        if top_k is not None and top_k < 1:
+            top_k = None
+
+        # 束搜索逻辑
+        if not do_sample and num_beams > 1:
+            return self._beam_search(idx, max_new_tokens, num_beams, temperature, top_k, stop_id)
+
+        # 贪婪解码和随机采样逻辑
+        index = idx.shape[1]
+        for _ in range(max_new_tokens):
+            # 如果序列上下文过长，截断它到最大长度
+            idx_cond = idx if idx.size(1) <= self.args.max_seq_len else idx[:, -self.args.max_seq_len:]
+
+            # 前向传播获取序列中最后一个位置的 logits
+            logits = self(idx_cond).logits
+            logits = logits[:, -1, :]  # 只保留最后一个时间步的输出
+
+            # 根据参数选择解码策略
+            if do_sample:
+                idx_next = self._random_sample(logits, temperature, top_k)
+            else:
+                # 当temperature=0时使用贪婪解码
+                if temperature < 0.1:
+                    idx_next = self._greedy_decode(logits)
+                else:
+                    # 低温度下的随机采样（接近贪婪）
+                    idx_next = self._random_sample(logits, temperature, top_k)
+
+            # 检查停止条件
+            if stop_id is not None and idx_next[0, 0] == stop_id:
+                break
+
+            # 将选择的token添加到序列中
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx[:, index:]  # 只返回生成的token
+
+
 if __name__ == '__main__':
     """
     模型测试和示例
