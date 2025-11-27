@@ -1,11 +1,26 @@
-import torch
+"""
+Tiny-K 模型实现
+
+这是一个基于Transformer架构的语言模型，采用了以下关键技术：
+1. RMSNorm：根均方归一化，替代LayerNorm
+2. RoPE：旋转位置编码，为序列添加位置信息
+3. GQA：分组查询注意力，减少KV缓存
+4. SwiGLU：门控线性单元激活函数
+5. 权重共享：词嵌入层和输出层共享权重
+
+模型架构参考LLaMA设计，但进行了简化优化。
+"""
+
 import math
-import torch.nn.functional as F
-from transformers import PreTrainedModel, AutoTokenizer
-from transformers import PretrainedConfig
+import os
 from typing import Any, Optional, Tuple
+import torch
+import torch.nn.functional as F
 from torch import nn
+
+from transformers import PreTrainedModel, AutoTokenizer
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers import PretrainedConfig
 
 
 class ModelConfig(PretrainedConfig):
@@ -227,10 +242,14 @@ class Attention(nn.Module):
 
         # 模型并行处理大小，默认为1（单GPU训练）
         # 在多GPU训练时，可以设置为GPU数量，将注意力头分配到不同GPU
-        model.parallel_size = 1
+        model_parallel_size = 1
+
+        # 本地计算头数，等于总头数除以模型并行处理大小
+        # 在单GPU情况下，等于总头数
+        self.n_local_heads = args.n_heads // model_parallel_size
 
         # 本地键值头数，等于键值头数除以模型并行处理大小
-        self.n_local_kv_heads = self.n_kv_heads // model.parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
 
         # 重复次数，用于扩展键和值的尺寸以匹配查询头的数量
         # 例如：n_local_heads=8, n_local_kv_heads=2, 则n_rep=4
@@ -640,7 +659,7 @@ class DecoderLayer(nn.Module):
 
         # 第二部分，前馈神经网络+残差连接
         # Pre-norm: 先归一化，在计算前馈，最后残差连接
-        out = x + self.feed_forward.forward(self.ffn_norm(h))
+        out = h + self.feed_forward.forward(self.ffn_norm(h))
 
         return out
 
@@ -697,20 +716,21 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
 
 class Transformer(PreTrainedModel):
     """
-    Tink_k Transformer参数
-    完整的Transformer解码器架构，包含
+    Tiny-K Transformer模型
+
+    完整的Transformer解码器架构，包含：
     1. 词嵌入层（Token Embedding）
     2. 多层解码器（Decoder Layers）
-    3. 输出层（output layer）
-    4. 权重共享（Embedding 和 output 共享权重）
+    3. 输出层（Output Layer）
+    4. 权重共享（Embedding和Output共享权重）
     5. 旋转位置编码（RoPE）
 
     模型流程：
-        token->Embedding->Dropout->DecoderLayers->RMSNorm->output-Logits
+        tokens -> Embedding -> Dropout -> DecoderLayers -> RMSNorm -> Output -> logits
     """
 
     config_class = ModelConfig  # 配置类，用于保存和加载模型配置
-    last_loss: Optional[torch.tensor]  # 记录最后一次损失值，用于调试
+    last_loss: Optional[torch.Tensor]  # 记录最后一次计算的损失，用于调试
 
     def __init__(self, args: ModelConfig = None):
         """
@@ -784,7 +804,7 @@ class Transformer(PreTrainedModel):
         self.OUT = CausalLMOutputWithPast()  # 输出容器，用于返回logits和loss
         self._no_split_modules = [name for name, _ in self.named_modules()]  # 不分割的模块列表（用于模型并行）
 
-    def __init_wights(self, module):
+    def _init_weights(self, module):
         """
         权重初始化函数
 
@@ -1150,25 +1170,61 @@ class Transformer(PreTrainedModel):
 
 if __name__ == '__main__':
     """
-    模型测试和示例
-    演示如何使用Tink-k模型进行前向传播
+    主函数：模型测试和示例
+
+    演示如何使用Tiny-K模型进行前向传播：
     1. 加载tokenizer
     2. 创建模型配置和实例
     3. 计算模型参数量
     4. 准备输入数据
     5. 进行前向传播
     """
-
-    # 加载tokenizer,用于将文本转换为token ids
-    AutoTokenizer.from_pretrained("tokenize_k")
+    # 加载tokenizer，用于将文本转换为token IDs
+    # 获取当前文件所在目录，然后构建 tokenizer 路径
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    tokenizer_path = os.path.join(current_dir, "../code/tokenizer_k/")
+    tokenizer_path = os.path.normpath(tokenizer_path)  # 规范化路径
+    # 添加 local_files_only=True 避免从 Hugging Face Hub 下载
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
 
     # 创建模型配置
-    # dim = 1024:模型隐藏层维度1024
-    # n_layer = 18:使用18层Transformer
+    # dim=1024: 模型隐藏层维度为1024
+    # n_layers=18: 使用18层Transformer
     # 其他参数使用默认值
     args = ModelConfig(
         dim=1024,
         n_layers=18,
     )
 
+    # 实例化Transformer模型
     model = Transformer(args=args)
+
+    # 计算模型的总参数量
+    # numel()返回张量中元素的总数
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f'LLM总参数量：{num_params / 1e6:.3f} 百万')
+
+    # 准备测试文本
+    prompt = "你好呀，今天吃什么呢？你过得怎么样嘞？"
+    # 添加开始和结束标记
+    text = f"{tokenizer.bos_token}{prompt}{tokenizer.eos_token}"
+    print(f"Input text: {text}")
+
+    # 将文本转换为token IDs
+    input_id = tokenizer(text).data['input_ids']
+    print("input_ids :", input_id)
+    # 验证tokenization：将token IDs转换回文本
+    print("dcode_str :", tokenizer.decode(input_id))
+
+    # 准备训练数据
+    # X: 输入序列（去掉最后一个token）
+    # Y: 目标序列（去掉第一个token，用于下一个token预测）
+    # unsqueeze(0)添加batch维度，形状从(seq_len,)变为(1, seq_len)
+    X = torch.tensor(input_id[:-1]).unsqueeze(0)
+    Y = torch.tensor(input_id[1:]).unsqueeze(0)
+    print("X shape :", X.shape)
+    print("Y shape :", Y.shape)
+
+    # 将输入张量传入模型进行前向传播
+    # 模型会计算logits和损失
+    output = model(X, Y)
