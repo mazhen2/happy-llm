@@ -5,6 +5,7 @@ from transformers import PreTrainedModel, AutoTokenizer
 from transformers import PretrainedConfig
 from typing import Any, Optional, Tuple
 from torch import nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class ModelConfig(PretrainedConfig):
@@ -642,6 +643,56 @@ class DecoderLayer(nn.Module):
         out = x + self.feed_forward.forward(self.ffn_norm(h))
 
         return out
+
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    """
+    预计算旋转位置编码（RoPE）的频率矩阵
+
+    RoPE (Rotary Position Embedding) 是一种相对位置编码方法，
+    通过旋转矩阵将位置信息编码到查询和键向量中。
+
+    核心思想：
+        对于位置m的向量x，通过旋转矩阵R_theta^m将其旋转，
+        使得不同位置的向量之间的内积能够反映相对位置关系。
+
+    数学原理：
+        1. 计算频率：freq_i = 1 / (theta^(2i/dim))，i从0到dim/2-1
+        2. 对于位置pos，计算角度：angle = pos * freq
+        3. 使用cos和sin生成旋转矩阵的系数
+
+    注意：此处的dim应为 dim//n_head，因为我们是对每个head进行旋转嵌入
+
+    Args:
+        dim: 每个注意力头的维度（head_dim），必须是偶数
+        end: 最大序列长度，用于预计算所有位置
+        theta: 频率基数，控制频率的衰减速度，默认10000.0
+
+    Returns:
+        freqs_cos: 余弦频率矩阵，形状为 (end, dim//2)
+        freqs_sin: 正弦频率矩阵，形状为 (end, dim//2)
+    """
+    # 生成频率序列：对于维度i，频率为 1/(theta^(2i/dim))
+    # torch.arange(0, dim, 2) 生成 [0, 2, 4, ..., dim-2]
+    # [: (dim // 2)] 确保只取前dim/2个元素
+    # 每个元素除以dim，再作为theta的指数，最后取倒数得到频率
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+
+    # 生成位置序列：从0到end-1的所有位置
+    t = torch.arange(end, device=freqs.device)
+
+    # 计算外积：将位置t与频率freqs相乘
+    # 结果矩阵的每一行对应一个位置，每一列对应一个频率维度
+    # 形状：(end, dim//2)
+    freqs = torch.outer(t, freqs).float()
+
+    # 计算余弦值，作为旋转矩阵的实部系数
+    freqs_cos = torch.cos(freqs)
+
+    # 计算正弦值，作为旋转矩阵的虚部系数
+    freqs_sin = torch.sin(freqs)
+
+    return freqs_cos, freqs_sin
 
 
 class Transformer(PreTrainedModel):
