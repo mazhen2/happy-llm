@@ -738,7 +738,151 @@ class Transformer(PreTrainedModel):
         for layer_id in range(args.n_layers):
             self.layers.append(DecoderLayer(layer_id, args))
 
-    pass
+        # 最终归一化层，在所有解码器层之后应用
+        self.norm = RMSNorm(args.dim, eps=args.norm_eps)
+
+        # 输出层:将隐藏状态映射回词汇表空间
+        # 输出logits,形状为  (batch_size, seq_len, vocab_size)
+        self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
+
+        # 权重共享：将词嵌入层的权重与输出层的权重共享
+        # 优点：
+        # 1. 减少参数量（节省vocab_size * dim 个参数）、
+        # 2. 减少训练量
+        # 3. 在语言模型中通常能提升性能
+        self.tok_embeddings.weight = self.output.weight
+
+        # 预计算旋转位置编码的频率矩阵
+        # 在初始化时计算，避免每次前向传播重复计算
+        # dim参数是每个头的维度：dim // n_heads
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            self.args.dim // self.args.n_heads,
+            self.args.max_seq_len
+        )
+        # 注册为缓冲区，会被包含在state_dict中，但不会被视为可训练参数
+        # persistent=False表示不会保存到checkpoint（可以重新计算）
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+        # 初始化所有权重
+        # 对每个模块递归调用_init_weights方法
+        self.apply(self._init_weights)
+
+        # 对残差投影进行特殊的缩放初始化
+        # 这是LLaMA的初始化策略，有助于深层网络的训练稳定性
+        # 缩放因子：1/sqrt(2*n_layers)，随着层数增加，初始化方差减小
+        for pn, p in self.named_parameters():
+            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
+                torch.nn.init.normal_(
+                    p,
+                    mean=0.0,
+                    std=0.02 / math.sqrt(2 * args.n_layers)
+                )
+
+        # 初始化输出相关的属性
+        self.last_loss = None  # 最后一次计算的损失
+        self.OUT = CausalLMOutputWithPast()  # 输出容器，用于返回logits和loss
+        self._no_split_modules = [name for name, _ in self.named_modules()]  # 不分割的模块列表（用于模型并行）
+
+    def __init_wights(self, module):
+        """
+        权重初始化函数
+
+        使用Xavier初始化的变体（正态分布）
+        - 线性层：均值为0，标准差为0.02的正态分布
+        - 嵌入层：均值为0，标准差为0.02的正态分布
+        - 偏置：初始化为0
+
+        Args:
+            module: 要初始化的模块（Linear或Embedding）
+        """
+        if isinstance(module, nn.Linear):
+            # 线性层权重初始化：正态分布，标准差0.02
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            # 如果存在偏置，初始化为0
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            # 嵌入层权重初始化：正态分布，标准差0.02
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
+        """
+        前向传播
+
+        完整的模型前向传播流程：
+        1. Token嵌入：将token IDs转换为向量
+        2. Dropout：防止过拟合
+        3. 多层解码器：通过所有Transformer层
+        4. 最终归一化：RMSNorm
+        5. 输出投影：映射到词汇表空间
+        6. 计算损失（如果提供了targets）
+
+        Args:
+            tokens: 输入token张量，形状为 (batch_size, seq_len)
+            targets: 目标token张量（用于训练），形状为 (batch_size, seq_len)
+            **kwargs: 其他关键字参数，支持input_ids和attention_mask（兼容transformers接口）
+
+        Returns:
+            CausalLMOutputWithPast对象，包含：
+            - logits: 模型输出logits，形状为 (batch_size, seq_len, vocab_size)
+            - last_loss: 损失值（如果提供了targets）
+        """
+        # 兼容transformers库的接口
+        if 'input_ids' in kwargs:
+            tokens = kwargs['input_ids']
+        if 'attention_mask' in kwargs:
+            targets = kwargs['attention_mask']
+
+        # 获取批次大小和序列长度
+        _bsz, seqlen = tokens.shape
+
+        # 步骤1：通过词嵌入层，将token IDs转换为向量
+        # 输入：(batch_size, seq_len)
+        # 输出：(batch_size, seq_len, dim)
+        h = self.tok_embeddings(tokens)
+
+        # 步骤2：应用dropout（仅在训练时）
+        h = self.dropout(h)
+
+        # 步骤3：获取当前序列长度对应的旋转位置编码频率
+        # 只取前seqlen个位置的频率（如果序列长度小于max_seq_len）
+        freqs_cos = self.freqs_cos[:seqlen]
+        freqs_sin = self.freqs_sin[:seqlen]
+
+        # 步骤4：通过所有解码器层
+        # 每一层都会应用注意力机制和前馈网络
+        for layer in self.layers:
+            h = layer(h, freqs_cos, freqs_sin)
+
+        # 步骤5：应用最终归一化层
+        h = self.norm(h)
+
+        # 步骤6：计算输出和损失
+        if targets is not None:
+            # 训练模式：计算所有位置的logits和损失
+            logits = self.output(h)  # (batch_size, seq_len, vocab_size)
+
+            # 计算交叉熵损失
+            # 将logits和targets展平为2D张量
+            # ignore_index=0表示忽略padding token（ID为0）
+            # reduction='none'返回每个样本的损失，不进行平均
+            self.last_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=0,
+                reduction='none'
+            )
+        else:
+            # 推理模式：只计算最后一个位置的logits（优化）
+            # 在自回归生成时，只需要最后一个位置的输出
+            logits = self.output(h[:, [-1], :])  # (batch_size, 1, vocab_size)
+            self.last_loss = None
+
+        # 设置输出容器
+        self.OUT.__setitem__('logits', logits)
+        self.OUT.__setitem__('last_loss', self.last_loss)
+        return self.OUT
 
 
 if __name__ == '__main__':
