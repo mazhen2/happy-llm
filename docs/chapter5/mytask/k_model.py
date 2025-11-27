@@ -1180,12 +1180,7 @@ if __name__ == '__main__':
     5. 进行前向传播
     """
     # 加载tokenizer，用于将文本转换为token IDs
-    # 获取当前文件所在目录，然后构建 tokenizer 路径
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    tokenizer_path = os.path.join(current_dir, "../code/tokenizer_k/")
-    tokenizer_path = os.path.normpath(tokenizer_path)  # 规范化路径
-    # 添加 local_files_only=True 避免从 Hugging Face Hub 下载
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained("tokenizer_k")
 
     # 创建模型配置
     # dim=1024: 模型隐藏层维度为1024
