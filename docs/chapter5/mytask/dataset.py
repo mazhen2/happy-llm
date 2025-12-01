@@ -290,58 +290,57 @@ class SFTDataset(Dataset):
 
         return mask
 
+    def __getitem__(self, index: int):
+        """
+        获取指定索引的数据样本
 
-def __getitem__(self, index: int):
-    """
-    获取指定索引的数据样本
+        处理流程：
+        1. 解析JSON数据，提取对话消息
+        2. 使用chat_template将对话格式转换为模型输入格式
+        3. 使用tokenizer编码文本为token ID序列
+        4. 截断或填充到max_length
+        5. 生成损失掩码，只对assistant回复部分计算损失
+        6. 生成输入序列X和目标序列Y
 
-    处理流程：
-    1. 解析JSON数据，提取对话消息
-    2. 使用chat_template将对话格式转换为模型输入格式
-    3. 使用tokenizer编码文本为token ID序列
-    4. 截断或填充到max_length
-    5. 生成损失掩码，只对assistant回复部分计算损失
-    6. 生成输入序列X和目标序列Y
+        Args:
+            index (int): 样本索引
 
-    Args:
-        index (int): 样本索引
+        Returns:
+            tuple: (X, Y, loss_mask)
+                - X (torch.Tensor): 输入序列，shape为[max_length-1]
+                - Y (torch.Tensor): 目标序列，shape为[max_length-1]
+                - loss_mask (torch.Tensor): 损失掩码，1表示计算损失，0表示忽略
+            """
+        # 解析JSON格式的数据行
+        sample = json.loads(self.data[index])
 
-    Returns:
-        tuple: (X, Y, loss_mask)
-            - X (torch.Tensor): 输入序列，shape为[max_length-1]
-            - Y (torch.Tensor): 目标序列，shape为[max_length-1]
-            - loss_mask (torch.Tensor): 损失掩码，1表示计算损失，0表示忽略
-    """
-    # 解析JSON格式的数据行
-    sample = json.loads(self.data[index])
+        # 使用chat_template将对话格式转换为模型输入格式
+        # tokenize=False: 返回文本而不是token ID
+        # add_generation_prompt=False: 不添加生成提示
+        text = self.tokenizer.apply_chat_template(sample, tokenize=False, add_generation_prompt=False)
 
-    # 使用chat_template将对话格式转换为模型输入格式
-    # tokenize=False: 返回文本而不是token ID
-    # add_generation_prompt=False: 不添加生成提示
-    text = self.tokenizer.apply_chat_template(sample, tokenize=False, add_generation_prompt=False)
+        # 使用tokenizer编码文本，并截断到最大长度
+        input_id = self.tokenizer(text).data['input_ids'][:self.max_length]
+        text_len = len(input_id)
 
-    # 使用tokenizer编码文本，并截断到最大长度
-    input_id = self.tokenizer(text).data['input_ids'][:self.max_length]
-    text_len = len(input_id)
+        # 计算需要填充的长度（如果文本长度小于max_length）
+        padding_len = self.max_length - text_len
 
-    # 计算需要填充的长度（如果文本长度小于max_length）
-    padding_len = self.max_length - text_len
+        # 在序列末尾添加padding token
+        input_id = input_id + [self.padding] * padding_len
 
-    # 在序列末尾添加padding token
-    input_id = input_id + [self.padding] * padding_len
+        # 生成损失掩码：只对assistant回复部分计算损失
+        loss_mask = self.generate_loss_mask(input_id)
 
-    # 生成损失掩码：只对assistant回复部分计算损失
-    loss_mask = self.generate_loss_mask(input_id)
+        # 转换为numpy数组
+        input_id = np.array(input_id)
 
-    # 转换为numpy数组
-    input_id = np.array(input_id)
+        # 生成输入序列X（前n-1个token）和目标序列Y（后n-1个token）
+        X = np.array(input_id[:-1]).astype(np.int64)
+        Y = np.array(input_id[1:]).astype(np.int64)
 
-    # 生成输入序列X（前n-1个token）和目标序列Y（后n-1个token）
-    X = np.array(input_id[:-1]).astype(np.int64)
-    Y = np.array(input_id[1:]).astype(np.int64)
+        # 损失掩码也需要相应调整（去掉第一个位置）
+        loss_mask = np.array(loss_mask[1:]).astype(np.int64)
 
-    # 损失掩码也需要相应调整（去掉第一个位置）
-    loss_mask = np.array(loss_mask[1:]).astype(np.int64)
-
-    # 转换为PyTorch张量并返回
-    return torch.from_numpy(X), torch.from_numpy(Y), torch.from_numpy(loss_mask)
+        # 转换为PyTorch张量并返回
+        return torch.from_numpy(X), torch.from_numpy(Y), torch.from_numpy(loss_mask)
